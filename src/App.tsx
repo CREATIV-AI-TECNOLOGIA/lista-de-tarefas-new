@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Plus,
   Trash2,
@@ -10,7 +10,6 @@ import {
   FileText,
   Clock,
   Play,
-  Pause,
   Calendar,
 } from 'lucide-react';
 
@@ -39,6 +38,10 @@ interface Task {
   completed: boolean;
   timeEntries: TimeEntry[];
   totalTime: number;
+  running?: {
+    isRunning: boolean;
+    startedAt: number;
+  };
 }
 
 interface Project {
@@ -69,6 +72,14 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Record<number, 'tasks' | 'notes'>>({});
   const [editingProject, setEditingProject] = useState<number | null>(null);
   const [activeTimers, setActiveTimers] = useState<ActiveTimerState>({});
+  const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'info' | 'error'; message: string }[]>([]);
+  const [confirm, setConfirm] = useState<{
+    open: boolean;
+    title: string;
+    message: string;
+    onConfirm?: () => void;
+    onCancel?: () => void;
+  }>({ open: false, title: '', message: '' });
 
   useEffect(() => {
     loadProjects();
@@ -122,7 +133,22 @@ const App: React.FC = () => {
     try {
       const result = await storageGet('dev-projects-v2');
       if (result?.value) {
-        setProjects(JSON.parse(result.value));
+        const parsed = JSON.parse(result.value) as Project[];
+        setProjects(parsed);
+        const timers: ActiveTimerState = {};
+        parsed.forEach((p) => {
+          p.tasks.forEach((t) => {
+            if (t.running?.isRunning && t.running.startedAt) {
+              const key = `${p.id}-${t.id}`;
+              timers[key] = {
+                isRunning: true,
+                startTime: t.running.startedAt,
+                elapsed: Date.now() - t.running.startedAt,
+              };
+            }
+          });
+        });
+        if (Object.keys(timers).length > 0) setActiveTimers(timers);
       }
     } finally {
       setLoading(false);
@@ -153,18 +179,51 @@ const App: React.FC = () => {
     };
     saveProjects([...projects, newProject]);
     setShowNewProject(false);
+    pushToast('success', 'Projeto criado');
   };
 
   const deleteProject = (id: number) => {
-    if (confirm('Tem certeza que deseja excluir este projeto?')) {
-      const updated = projects.filter((p) => p.id !== id);
-      saveProjects(updated);
-      if (expandedProject === id) setExpandedProject(null);
-    }
+    setConfirm({
+      open: true,
+      title: 'Excluir projeto',
+      message: 'Tem certeza que deseja excluir este projeto? Essa ação é permanente.',
+      onConfirm: () => {
+        const updated = projects.filter((p) => p.id !== id);
+        saveProjects(updated);
+        if (expandedProject === id) setExpandedProject(null);
+        pushToast('success', 'Projeto excluído');
+        setConfirm({ open: false, title: '', message: '' });
+      },
+      onCancel: () => setConfirm({ open: false, title: '', message: '' }),
+    });
   };
 
   const updateProject = (id: number, updates: Partial<Project>) => {
-    const updated = projects.map((p) => (p.id === id ? { ...p, ...updates } : p));
+    const updated = projects.map((p) => {
+      if (p.id !== id) return p;
+      const next = { ...p, ...updates } as Project;
+      if (updates.status === 'completed') {
+        next.tasks = p.tasks.map((t) => {
+          if (t.running?.isRunning && t.running.startedAt) {
+            const duration = Date.now() - t.running.startedAt;
+            const entry: TimeEntry = {
+              start: new Date(t.running.startedAt).toISOString(),
+              end: new Date().toISOString(),
+              duration,
+            };
+            return {
+              ...t,
+              running: { isRunning: false, startedAt: 0 },
+              timeEntries: [...(t.timeEntries || []), entry],
+              totalTime: (t.totalTime || 0) + duration,
+              completed: true,
+            };
+          }
+          return t;
+        });
+      }
+      return next;
+    });
     saveProjects(updated);
   };
 
@@ -177,55 +236,81 @@ const App: React.FC = () => {
       completed: false,
       timeEntries: [],
       totalTime: 0,
+      running: { isRunning: false, startedAt: 0 },
     };
     updateProject(projectId, { tasks: [...project.tasks, newTask] });
+    pushToast('success', 'Tarefa criada');
   };
 
   const toggleTask = (projectId: number, taskId: number) => {
     const project = projects.find((p) => p.id === projectId);
     if (!project) return;
-    updateProject(projectId, {
-      tasks: project.tasks.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t)),
-    });
+    const target = project.tasks.find((t) => t.id === taskId);
+    if (!target) return;
+    const willComplete = !target.completed;
+    let updatedTasks = project.tasks.map((t) => t);
+    if (willComplete) {
+      if (target.running?.isRunning && target.running.startedAt) {
+        const duration = Date.now() - target.running.startedAt;
+        const entry: TimeEntry = {
+          start: new Date(target.running.startedAt).toISOString(),
+          end: new Date().toISOString(),
+          duration,
+        };
+        updatedTasks = project.tasks.map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                completed: true,
+                running: { isRunning: false, startedAt: 0 },
+                timeEntries: [...(t.timeEntries || []), entry],
+                totalTime: (t.totalTime || 0) + duration,
+              }
+            : t,
+        );
+      } else {
+        updatedTasks = project.tasks.map((t) => (t.id === taskId ? { ...t, completed: true } : t));
+      }
+    } else {
+      updatedTasks = project.tasks.map((t) => (t.id === taskId ? { ...t, completed: false } : t));
+    }
+    updateProject(projectId, { tasks: updatedTasks });
   };
 
   const deleteTask = (projectId: number, taskId: number) => {
-    const project = projects.find((p) => p.id === projectId);
-    if (!project) return;
-    updateProject(projectId, { tasks: project.tasks.filter((t) => t.id !== taskId) });
+    setConfirm({
+      open: true,
+      title: 'Excluir tarefa',
+      message: 'Tem certeza que deseja excluir esta tarefa?',
+      onConfirm: () => {
+        const project = projects.find((p) => p.id === projectId);
+        if (!project) return;
+        updateProject(projectId, { tasks: project.tasks.filter((t) => t.id !== taskId) });
+        pushToast('success', 'Tarefa excluída');
+        setConfirm({ open: false, title: '', message: '' });
+      },
+      onCancel: () => setConfirm({ open: false, title: '', message: '' }),
+    });
   };
 
   const startTimer = (projectId: number, taskId: number) => {
+    const project = projects.find((p) => p.id === projectId);
+    if (!project) return;
+    const task = project.tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    if (task.completed) return;
+    const startedAt = Date.now();
     const key = `${projectId}-${taskId}`;
+    const updatedTasks = project.tasks.map((t) =>
+      t.id === taskId ? { ...t, running: { isRunning: true, startedAt } } : t,
+    );
+    updateProject(projectId, { tasks: updatedTasks });
     setActiveTimers((prev) => ({
       ...prev,
-      [key]: { isRunning: true, startTime: Date.now(), elapsed: 0 },
+      [key]: { isRunning: true, startTime: startedAt, elapsed: Date.now() - startedAt },
     }));
   };
 
-  const stopTimer = (projectId: number, taskId: number) => {
-    const key = `${projectId}-${taskId}`;
-    const timer = activeTimers[key];
-    if (!timer || !timer.isRunning) return;
-    const project = projects.find((p) => p.id === projectId);
-    if (!project) return;
-    const timeEntry: TimeEntry = {
-      start: new Date(timer.startTime).toISOString(),
-      end: new Date().toISOString(),
-      duration: timer.elapsed,
-    };
-    const updatedTasks = project.tasks.map((t) =>
-      t.id === taskId
-        ? { ...t, timeEntries: [...(t.timeEntries || []), timeEntry], totalTime: (t.totalTime || 0) + timer.elapsed }
-        : t,
-    );
-    updateProject(projectId, { tasks: updatedTasks });
-    setActiveTimers((prev) => {
-      const cloned = { ...prev } as ActiveTimerState;
-      delete cloned[key];
-      return cloned;
-    });
-  };
 
   const getStatusColor = (status: ProjectStatus) => {
     const colors: Record<ProjectStatus, string> = {
@@ -239,9 +324,9 @@ const App: React.FC = () => {
 
   const getPriorityColor = (priority: ProjectPriority) => {
     const colors: Record<ProjectPriority, string> = {
-      high: 'border-l-4 border-red-500',
-      medium: 'border-l-4 border-yellow-500',
-      low: 'border-l-4 border-green-500',
+      high: 'border-l-[var(--border-1)] border-red-500',
+      medium: 'border-l-[var(--border-1)] border-yellow-500',
+      low: 'border-l-[var(--border-1)] border-green-500',
     };
     return colors[priority] || colors.medium;
   };
@@ -257,10 +342,31 @@ const App: React.FC = () => {
 
   const completedTasks = projects.reduce((acc, p) => acc + p.tasks.filter((t) => t.completed).length, 0);
   const totalTasks = projects.reduce((acc, p) => acc + p.tasks.length, 0);
-  const totalTimeSpent = projects.reduce(
-    (acc, p) => acc + p.tasks.reduce((tAcc, t) => tAcc + (t.totalTime || 0), 0),
-    0,
-  );
+  const totalTimeSpent = useMemo(() => {
+    return projects.reduce((acc, p) => {
+      return (
+        acc +
+        p.tasks.reduce((tAcc, t) => {
+          const runningExtra = t.running?.isRunning && t.running.startedAt ? Date.now() - t.running.startedAt : 0;
+          return tAcc + (t.totalTime || 0) + runningExtra;
+        }, 0)
+      );
+    }, 0);
+  }, [projects, activeTimers]);
+
+  const pushToast = (type: 'success' | 'info' | 'error', message: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, type, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3000);
+  };
+
+  const getToastClass = (type: 'success' | 'info' | 'error') => {
+    if (type === 'success') return 'px-4 py-2 rounded-[var(--radius-sm)] border shadow-sm bg-green-50 border-green-200 text-green-800';
+    if (type === 'error') return 'px-4 py-2 rounded-[var(--radius-sm)] border shadow-sm bg-red-50 border-red-200 text-red-800';
+    return 'px-4 py-2 rounded-[var(--radius-sm)] border shadow-sm bg-blue-50 border-blue-200 text-blue-800';
+  };
 
   if (loading) {
     return (
@@ -273,28 +379,28 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-6xl mx-auto">
-        <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
+        <div className="bg-white rounded-[var(--radius-card)] border p-6 mb-6">
           <div className="flex items-center justify-between mb-4">
             <h1 className="text-3xl font-bold text-gray-900">Meus Projetos</h1>
-            <button onClick={() => setShowNewProject(true)} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors">
+            <button onClick={() => setShowNewProject(true)} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-[var(--radius-sm)] hover:bg-blue-700 transition-colors focus-ring">
               <Plus size={20} />
               Novo Projeto
             </button>
           </div>
           <div className="grid grid-cols-4 gap-4">
-            <div className="bg-blue-50 rounded-lg p-4">
+            <div className="bg-blue-50 rounded-[var(--radius-card)] border p-4">
               <div className="text-blue-600 text-sm font-medium">Total de Projetos</div>
               <div className="text-2xl font-bold text-blue-900">{projects.length}</div>
             </div>
-            <div className="bg-green-50 rounded-lg p-4">
+            <div className="bg-green-50 rounded-[var(--radius-card)] border p-4">
               <div className="text-green-600 text-sm font-medium">Tarefas Concluídas</div>
               <div className="text-2xl font-bold text-green-900">{completedTasks}/{totalTasks}</div>
             </div>
-            <div className="bg-purple-50 rounded-lg p-4">
+            <div className="bg-purple-50 rounded-[var(--radius-card)] border p-4">
               <div className="text-purple-600 text-sm font-medium">Em Desenvolvimento</div>
               <div className="text-2xl font-bold text-purple-900">{projects.filter((p) => p.status === 'development').length}</div>
             </div>
-            <div className="bg-orange-50 rounded-lg p-4">
+            <div className="bg-orange-50 rounded-[var(--radius-card)] border p-4">
               <div className="text-orange-600 text-sm font-medium">Tempo Total</div>
               <div className="text-2xl font-bold text-orange-900">{formatTime(totalTimeSpent)}</div>
             </div>
@@ -305,7 +411,7 @@ const App: React.FC = () => {
         )}
         <div className="space-y-4">
           {projects.length === 0 ? (
-            <div className="bg-white rounded-lg shadow-sm p-12 text-center">
+            <div className="bg-white rounded-[var(--radius-card)] border p-12 text-center">
               <Target size={48} className="mx-auto text-gray-400 mb-4" />
               <h3 className="text-xl font-semibold text-gray-700 mb-2">Nenhum projeto ainda</h3>
               <p className="text-gray-500">Crie seu primeiro projeto para começar a organizar suas ideias!</p>
@@ -323,7 +429,6 @@ const App: React.FC = () => {
                 onToggleTask={(taskId) => toggleTask(project.id, taskId)}
                 onDeleteTask={(taskId) => deleteTask(project.id, taskId)}
                 onStartTimer={(taskId) => startTimer(project.id, taskId)}
-                onStopTimer={(taskId) => stopTimer(project.id, taskId)}
                 activeTimers={activeTimers}
                 activeTab={activeTab[project.id] || 'tasks'}
                 setActiveTab={(tab) => setActiveTab({ ...activeTab, [project.id]: tab })}
@@ -337,6 +442,35 @@ const App: React.FC = () => {
           )}
         </div>
       </div>
+        <ConfirmModal open={confirm.open} title={confirm.title} message={confirm.message} onConfirm={confirm.onConfirm} onCancel={confirm.onCancel} />
+        <ToastContainer toasts={toasts} getClass={getToastClass} />
+  </div>
+  );
+};
+
+const ConfirmModal: React.FC<{ open: boolean; title: string; message: string; onConfirm?: () => void; onCancel?: () => void }> = ({ open, title, message, onConfirm, onCancel }) => {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className="bg-white rounded-[var(--radius-card)] border p-6 w-full max-w-md">
+        <h4 className="text-lg font-semibold mb-2">{title}</h4>
+        <p className="text-sm text-gray-600 mb-4">{message}</p>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel} className="px-4 py-2 border rounded-[var(--radius-sm)]">Cancelar</button>
+          <button onClick={onConfirm} className="px-4 py-2 bg-red-600 text-white rounded-[var(--radius-sm)]">Confirmar</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ToastContainer: React.FC<{ toasts: { id: number; type: 'success' | 'info' | 'error'; message: string }[]; getClass: (type: 'success' | 'info' | 'error') => string }> = ({ toasts, getClass }) => {
+  if (!toasts || toasts.length === 0) return null;
+  return (
+    <div className="fixed top-4 right-4 z-50 space-y-2">
+      {toasts.map((t) => (
+        <div key={t.id} className={getClass(t.type)}>{t.message}</div>
+      ))}
     </div>
   );
 };
@@ -367,7 +501,7 @@ const NewProjectForm: React.FC<NewProjectFormProps> = ({ onAdd, onCancel }) => {
   };
 
   return (
-    <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
+    <div className="bg-white rounded-[var(--radius-card)] border p-6 mb-6">
       <h3 className="text-lg font-semibold mb-4">Novo Projeto</h3>
       <div className="space-y-4">
         <div>
@@ -377,7 +511,7 @@ const NewProjectForm: React.FC<NewProjectFormProps> = ({ onAdd, onCancel }) => {
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyPress={handleKeyPress}
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            className="w-full px-4 py-2 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             placeholder="Ex: App de Finanças Pessoais"
             autoFocus
           />
@@ -388,7 +522,7 @@ const NewProjectForm: React.FC<NewProjectFormProps> = ({ onAdd, onCancel }) => {
             <select
               value={priority}
               onChange={(e) => setPriority(e.target.value as ProjectPriority)}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full px-4 py-2 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
               <option value="high">Alta</option>
               <option value="medium">Média</option>
@@ -401,7 +535,7 @@ const NewProjectForm: React.FC<NewProjectFormProps> = ({ onAdd, onCancel }) => {
               type="date"
               value={startDate}
               onChange={(e) => setStartDate(e.target.value)}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full px-4 py-2 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
           <div>
@@ -410,13 +544,13 @@ const NewProjectForm: React.FC<NewProjectFormProps> = ({ onAdd, onCancel }) => {
               type="date"
               value={endDate}
               onChange={(e) => setEndDate(e.target.value)}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full px-4 py-2 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
         </div>
         <div className="flex gap-3">
-          <button onClick={handleSubmit} className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors">Criar Projeto</button>
-          <button onClick={onCancel} className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors">Cancelar</button>
+          <button onClick={handleSubmit} className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-[var(--radius-sm)] hover:bg-blue-700 transition-colors">Criar Projeto</button>
+          <button onClick={onCancel} className="px-4 py-2 border rounded-[var(--radius-sm)] hover:bg-gray-50 transition-colors">Cancelar</button>
         </div>
       </div>
     </div>
@@ -433,7 +567,6 @@ interface ProjectCardProps {
   onToggleTask: (taskId: number) => void;
   onDeleteTask: (taskId: number) => void;
   onStartTimer: (taskId: number) => void;
-  onStopTimer: (taskId: number) => void;
   activeTimers: ActiveTimerState;
   activeTab: 'tasks' | 'notes';
   setActiveTab: (tab: 'tasks' | 'notes') => void;
@@ -454,7 +587,6 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
   onToggleTask,
   onDeleteTask,
   onStartTimer,
-  onStopTimer,
   activeTimers,
   activeTab,
   setActiveTab,
@@ -501,14 +633,14 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
 
   const pendingTasks = project.tasks.filter((t) => !t.completed).length;
   const daysUntilDeadline = getDaysUntilDeadline(project.endDate);
-  const projectTotalTime = project.tasks.reduce((acc, t) => acc + (t.totalTime || 0), 0);
+  const projectTotalTime = project.tasks.reduce((acc, t) => acc + (t.totalTime || 0) + (t.running?.isRunning && t.running.startedAt ? Date.now() - t.running.startedAt : 0), 0);
 
   return (
-    <div className={`bg-white rounded-lg shadow-sm ${getPriorityColor(project.priority)}`}>
+    <div className={`bg-white rounded-[var(--radius-card)] border ${getPriorityColor(project.priority)}`}>
       <div className="p-6">
         <div className="flex items-start justify-between">
           <div className="flex items-start gap-3 flex-1">
-            <button onClick={onToggleExpand} className="mt-1 text-gray-500 hover:text-gray-700">
+            <button onClick={onToggleExpand} className="mt-1 text-gray-500 hover:text-gray-700 focus-ring">
               {expanded ? <ChevronDown size={20} /> : <ChevronRight size={20} />}
             </button>
             <div className="flex-1">
@@ -521,7 +653,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') setEditingProject(null);
                   }}
-                  className="text-xl font-semibold w-full px-2 py-1 border border-blue-500 rounded"
+                  className="text-xl font-semibold w-full px-2 py-1 border rounded-[var(--radius-sm)]"
                   autoFocus
                 />
               ) : (
@@ -571,19 +703,19 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
             </div>
           </div>
           <div className="flex gap-2">
-            <button onClick={() => setShowGoals(!showGoals)} className="p-2 text-gray-500 hover:text-green-600 hover:bg-green-50 rounded-lg transition-colors" title="Metas">
+            <button onClick={() => setShowGoals(!showGoals)} className="p-2 text-gray-500 hover:text-green-600 hover:bg-green-50 rounded-[var(--radius-sm)] transition-colors" title="Metas">
               <Target size={18} />
             </button>
-            <button onClick={() => setEditingProject(project.id)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
+            <button onClick={() => setEditingProject(project.id)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-[var(--radius-sm)] transition-colors">
               <Edit2 size={18} />
             </button>
-            <button onClick={onDelete} className="p-2 text-gray-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors">
+            <button onClick={onDelete} className="p-2 text-gray-500 hover:text-red-600 hover:bg-red-50 rounded-[var(--radius-sm)] transition-colors">
               <Trash2 size={18} />
             </button>
           </div>
         </div>
         {showGoals && (
-          <div className="mt-4 p-4 bg-green-50 rounded-lg">
+          <div className="mt-4 p-4 bg-green-50 rounded-[var(--radius-card)] border">
             <h4 className="font-semibold text-green-900 mb-3 flex items-center gap-2">
               <Target size={18} />
               Metas do Projeto
@@ -595,7 +727,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                   type="date"
                   value={project.startDate || ''}
                   onChange={(e) => onUpdate({ startDate: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                  className="w-full px-3 py-2 border rounded-[var(--radius-sm)] text-sm"
                 />
               </div>
               <div>
@@ -604,7 +736,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                   type="date"
                   value={project.endDate || ''}
                   onChange={(e) => onUpdate({ endDate: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                  className="w-full px-3 py-2 border rounded-[var(--radius-sm)] text-sm"
                 />
               </div>
             </div>
@@ -651,7 +783,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               </button>
             </div>
             {activeTab === 'tasks' && (
-              <div>
+              <div className="max-h-[480px] overflow-auto">
                 <div className="flex gap-2 mb-4">
                   <input
                     type="text"
@@ -659,9 +791,9 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                     onChange={(e) => setNewTaskText(e.target.value)}
                     onKeyPress={handleTaskKeyPress}
                     placeholder="Adicionar nova tarefa..."
-                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    className="flex-1 px-4 py-2 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   />
-                  <button onClick={handleAddTask} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                  <button onClick={handleAddTask} className="px-4 py-2 bg-blue-600 text-white rounded-[var(--radius-sm)] hover:bg-blue-700 transition-colors">
                     <Plus size={20} />
                   </button>
                 </div>
@@ -681,10 +813,8 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                         onSaveTask={handleSaveTask}
                         onEditTaskKeyPress={handleEditTaskKeyPress}
                         setEditTaskText={setEditTaskText}
-                        setEditingTask={setEditingTask}
                         onDeleteTask={onDeleteTask}
                         onStartTimer={onStartTimer}
-                        onStopTimer={onStopTimer}
                         activeTimers={activeTimers}
                       />
                     ))
@@ -698,7 +828,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                   value={project.notes}
                   onChange={(e) => onUpdate({ notes: e.target.value })}
                   placeholder="Escreva suas notas aqui... ideias, especificações técnicas, bugs, etc."
-                  className="w-full h-64 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                  className="w-full h-64 px-4 py-3 border rounded-[var(--radius-sm)] focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
                 />
               </div>
             )}
@@ -719,10 +849,8 @@ interface TaskItemProps {
   onSaveTask: () => void;
   onEditTaskKeyPress: (e: React.KeyboardEvent<HTMLInputElement>) => void;
   setEditTaskText: (value: string) => void;
-  setEditingTask: (id: number | null) => void;
   onDeleteTask: (taskId: number) => void;
   onStartTimer: (taskId: number) => void;
-  onStopTimer: (taskId: number) => void;
   activeTimers: ActiveTimerState;
 }
 
@@ -736,10 +864,8 @@ const TaskItem: React.FC<TaskItemProps> = ({
   onSaveTask,
   onEditTaskKeyPress,
   setEditTaskText,
-  setEditingTask,
   onDeleteTask,
   onStartTimer,
-  onStopTimer,
   activeTimers,
 }) => {
   const [showTimeHistory, setShowTimeHistory] = useState(false);
@@ -747,7 +873,7 @@ const TaskItem: React.FC<TaskItemProps> = ({
   const activeTimer = activeTimers[timerKey];
   const isRunning = activeTimer?.isRunning;
   return (
-    <div className="bg-gray-50 rounded-lg p-3 hover:bg-gray-100 transition-colors">
+    <div className="bg-gray-50 rounded-[var(--radius-sm)] border p-3 hover:bg-gray-100 transition-colors">
       <div className="flex items-center gap-3">
         <input type="checkbox" checked={task.completed} onChange={() => onToggleTask(task.id)} className="w-5 h-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
         {editingTask === task.id ? (
@@ -757,29 +883,27 @@ const TaskItem: React.FC<TaskItemProps> = ({
             onChange={(e) => setEditTaskText(e.target.value)}
             onBlur={onSaveTask}
             onKeyDown={onEditTaskKeyPress}
-            className="flex-1 px-2 py-1 border border-blue-500 rounded"
+            className="flex-1 px-2 py-1 border rounded-[var(--radius-sm)]"
             autoFocus
           />
         ) : (
           <span className={`flex-1 ${task.completed ? 'line-through text-gray-500' : 'text-gray-900'}`}>{task.text}</span>
         )}
         <div className="flex items-center gap-2">
-          {task.totalTime > 0 && (
+          {((task.totalTime || 0) + (task.running?.isRunning && task.running.startedAt ? Date.now() - task.running.startedAt : 0)) > 0 && (
             <button onClick={() => setShowTimeHistory(!showTimeHistory)} className="flex items-center gap-1 text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded" title="Ver histórico">
               <Clock size={12} />
-              {formatTime(task.totalTime)}
+              {formatTime((task.totalTime || 0) + (task.running?.isRunning && task.running.startedAt ? Date.now() - task.running.startedAt : 0))}
             </button>
           )}
-          {isRunning ? (
-            <button onClick={() => onStopTimer(task.id)} className="flex items-center gap-1 bg-red-500 text-white px-3 py-1 rounded text-sm hover:bg-red-600">
-              <Pause size={14} />
-              Pausar
-            </button>
-          ) : (
-            <button onClick={() => onStartTimer(task.id)} className="flex items-center gap-1 bg-green-500 text-white px-3 py-1 rounded text-sm hover:bg-green-600">
+          {!isRunning && !task.completed && (
+            <button onClick={() => onStartTimer(task.id)} className="flex items-center gap-1 bg-green-500 text-white px-3 py-1 rounded-[var(--radius-sm)] text-sm hover:bg-green-600">
               <Play size={14} />
               Iniciar
             </button>
+          )}
+          {isRunning && (
+            <span className="px-3 py-1 bg-green-100 text-green-700 rounded-[var(--radius-sm)] text-sm">Em execução</span>
           )}
           <button onClick={() => onEditTask(task)} className="p-1 text-gray-400 hover:text-blue-600">
             <Edit2 size={14} />

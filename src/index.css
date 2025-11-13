@@ -8,8 +8,14 @@
   --radius-card: 12px;
   --radius-lg: 16px;
   --border-1: 1px;
+  --ring: 217 91% 60%;
 }
 
 body {
   margin: 0;
+}
+
+.focus-ring:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
 }
